@@ -1,5 +1,3 @@
-# This was built on top of test.py to have consistent metrics for the transformer model as for the RNN.
-
 import copy
 import numpy as np
 import pickle
@@ -65,9 +63,9 @@ test_dataset = sequences_test.map(split_input_target)
 BATCH_SIZE = 64
 BUFFER_SIZE = 10000
 
-train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE, drop_remainder=True)
-val_dataset = val_dataset.batch(BATCH_SIZE, drop_remainder=True)
-test_dataset = test_dataset.batch(BATCH_SIZE, drop_remainder=True)
+train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+val_dataset = val_dataset.batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+test_dataset = test_dataset.batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
 
 for x_batch, y_batch in train_dataset.take(10):
@@ -78,6 +76,11 @@ for x_batch, y_batch in train_dataset.take(10):
     print("Decoded input:", first_input)
     print("Decoded target:", first_target)
     break
+
+# Calculate steps_per_epoch for the learning rate schedule
+# This needs to be after train_text, seq_length, and BATCH_SIZE are defined.
+num_train_sequences = len(train_text) // (seq_length + 1)
+steps_per_epoch = num_train_sequences // BATCH_SIZE
 
 rnn_units = 100
 embedding_dim = rnn_units//2
@@ -346,10 +349,6 @@ model = tf.keras.Sequential([
 # # char_val_dataset_aug = tf.data.Dataset.from_tensor_slices(val_text_aug)
 # # char_test_dataset_aug = tf.data.Dataset.from_tensor_slices(test_text_aug)
 # 
-# # sequences_train_aug = char_train_dataset_aug.batch(seq_length + 1, drop_remainder=True)
-# # sequences_val_aug = char_val_dataset_aug.batch(seq_length + 1, drop_remainder=True)
-# # sequences_test_aug = char_test_dataset_aug.batch(seq_length + 1, drop_remainder=True)
-# 
 # # def split_input_target(chunk): # This function is already defined earlier
 # #     input_text = chunk[:-1]
 # #     target_text = chunk[1:]
@@ -374,6 +373,10 @@ model = tf.keras.Sequential([
 # 3. Transformer Model (nano-GPT inspired, character-level)
 # ---------------------------
 
+def create_look_ahead_mask(size): # Reinstated function
+    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    return mask  # (size, size)
+
 def get_angles(pos, i, d_model):
     angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
     return pos * angle_rates
@@ -392,17 +395,20 @@ def positional_encoding(position, d_model):
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
         super(TransformerBlock, self).__init__()
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim, dropout=rate)
         self.ffn = tf.keras.Sequential(
-            [layers.Dense(ff_dim, activation="relu"), layers.Dense(embed_dim),]
+            [
+                layers.Dense(ff_dim, activation="relu", use_bias=False), # Added use_bias=False
+                layers.Dense(embed_dim, use_bias=False) # Added use_bias=False
+            ]
         )
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6) # nanoGPT often uses 1e-5, but 1e-6 is also common
         self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
         self.dropout1 = layers.Dropout(rate)
         self.dropout2 = layers.Dropout(rate)
 
     def call(self, inputs, look_ahead_mask, training=None):
-        attn_output = self.att(inputs, inputs, inputs, attention_mask=look_ahead_mask, training=training)
+        attn_output = self.att(query=inputs, value=inputs, key=inputs, attention_mask=look_ahead_mask, training=training)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(inputs + attn_output)
         ffn_output = self.ffn(out1)
@@ -410,34 +416,25 @@ class TransformerBlock(layers.Layer):
         return self.layernorm2(out1 + ffn_output)
 
 class TokenAndPositionEmbedding(layers.Layer):
-    def __init__(self, maxlen, vocab_size, embed_dim):
+    def __init__(self, maxlen, vocab_size, embed_dim, dropout_rate=0.1): # Added dropout_rate
         super(TokenAndPositionEmbedding, self).__init__()
         self.token_emb = layers.Embedding(input_dim=vocab_size, output_dim=embed_dim)
-        self.pos_emb = positional_encoding(maxlen, embed_dim)
+        # Learned positional embeddings
+        self.pos_emb = layers.Embedding(input_dim=maxlen, output_dim=embed_dim)
         self.maxlen = maxlen
+        self.dropout = layers.Dropout(dropout_rate) # Added dropout layer
 
-    def call(self, x):
-        # Ensure x is not longer than maxlen for positional embedding
-        # This might happen during sampling if input grows
+    def call(self, x, training=None): # Added training argument for dropout
         seq_len = tf.shape(x)[-1]
-        # If seq_len is dynamic (e.g. during inference), slice self.pos_emb
-        # This assumes self.pos_emb is pre-calculated up to self.maxlen
-        # For training, seq_len will be fixed by the input sequences.
+        positions = tf.range(start=0, limit=seq_len, delta=1)
         
-        # Make sure token embeddings are generated for the actual sequence length
         embedded_tokens = self.token_emb(x)
+        embedded_positions = self.pos_emb(positions)
         
-        # Add positional encoding, slicing it if necessary
-        # The positional encoding is (1, maxlen, embed_dim)
-        # We need (batch_size, seq_len, embed_dim)
-        # For training, seq_len matches a dimension of pos_emb
-        # For inference, it could be shorter.
-        current_pos_emb = self.pos_emb[:, :seq_len, :]
-        return embedded_tokens + current_pos_emb
-
-def create_look_ahead_mask(size):
-    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
-    return mask  # (size, size)
+        # Add token and position embeddings
+        x = embedded_tokens + embedded_positions
+        x = self.dropout(x, training=training) # Apply dropout
+        return x
 
 class TransformerModel(tf.keras.Model):
     def __init__(self, num_layers, embed_dim, num_heads, ff_dim, vocab_size, maxlen, rate=0.1):
@@ -446,7 +443,7 @@ class TransformerModel(tf.keras.Model):
         self.num_layers = num_layers
         self.maxlen = maxlen
 
-        self.embedding_layer = TokenAndPositionEmbedding(maxlen, vocab_size, embed_dim)
+        self.embedding_layer = TokenAndPositionEmbedding(maxlen, vocab_size, embed_dim, dropout_rate=rate) # Pass dropout_rate
         self.transformer_blocks = [
             TransformerBlock(embed_dim, num_heads, ff_dim, rate) for _ in range(num_layers)
         ]
@@ -454,56 +451,104 @@ class TransformerModel(tf.keras.Model):
         self.final_layer = layers.Dense(vocab_size)
 
     def call(self, inputs, training):
-        seq_len = tf.shape(inputs)[1]
-        look_ahead_mask = create_look_ahead_mask(seq_len)
+        seq_len = tf.shape(inputs)[1] # Needed for mask creation
+        look_ahead_mask = create_look_ahead_mask(seq_len) # Create mask
         
         x = self.embedding_layer(inputs) # (batch_size, seq_len, embed_dim)
         
         for i in range(self.num_layers):
-            x = self.transformer_blocks[i](x, look_ahead_mask=look_ahead_mask, training=training)
+            x = self.transformer_blocks[i](x, look_ahead_mask=look_ahead_mask, training=training) # Pass look_ahead_mask
             
         x = self.dropout(x, training=training)
         return self.final_layer(x) # (batch_size, seq_len, vocab_size)
 
 # Transformer Hyperparameters (character-level)
-TRANSFORMER_NUM_LAYERS = 1  # Increased from 1 to 2 for better capacity
-TRANSFORMER_EMBED_DIM = 128 # Embedding dimension
+TRANSFORMER_NUM_LAYERS = 2  # Increased from 2 to 4 for better capacity
+TRANSFORMER_EMBED_DIM = 256 # Increased from 128
 TRANSFORMER_NUM_HEADS = 4   # Number of attention heads
-TRANSFORMER_FF_DIM = 256    # Hidden layer size in FFN
+TRANSFORMER_FF_DIM = 4 * TRANSFORMER_EMBED_DIM    # Hidden layer size in FFN, increased
 TRANSFORMER_MAXLEN = seq_length # Max sequence length for positional encoding, same as RNN/LSTM
-TRANSFORMER_RATE = 0.2      # Dropout rate
-# Calculate steps for learning rate schedule
-# STEPS_PER_EPOCH can be derived from the training logs or dataset size
-# From previous logs, it was 582 steps per epoch.
-STEPS_PER_EPOCH = 582 
-WARMUP_STEPS = STEPS_PER_EPOCH * 1 # Warmup for 1 epoch
+TRANSFORMER_RATE = 0.1      # Dropout rate, can be 0.1 or 0.2. nanoGPT often uses 0.0 for small models, 0.1 or 0.2 for larger. Let's try 0.1
+WEIGHT_DECAY = 0.01        # Weight decay for AdamW
+LEARNING_RATE = 6e-4       # Initial learning rate (nanoGPT default for char-level)
+WARMUP_EPOCHS = 1          # Number of epochs for warmup (e.g., 1-2 epochs)
+MIN_LEARNING_RATE = 6e-5   # Minimum learning rate for cosine decay
 
-# Custom Learning Rate Schedule from "Attention Is All You Need" paper
+warmup_steps_calculated = WARMUP_EPOCHS * steps_per_epoch
+
+# Cosine Decay with Warmup Learning Rate Schedule - Keras Subclass
 class CustomLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, d_model, warmup_steps=4000):
+    def __init__(self, learning_rate_base,
+                 total_steps,
+                 warmup_steps_arg,
+                 min_learning_rate=0.0,
+                 warmup_learning_rate=0.0,
+                 hold_base_rate_steps=0):
         super(CustomLearningRateSchedule, self).__init__()
-        self.d_model = tf.cast(d_model, tf.float32)
-        self.warmup_steps = float(warmup_steps)
+        self.learning_rate_base = learning_rate_base
+        self.total_steps = float(total_steps)
+        self.warmup_steps_arg = float(warmup_steps_arg)
+        self.min_learning_rate = float(min_learning_rate)
+        self.warmup_learning_rate = float(warmup_learning_rate)
+        self.hold_base_rate_steps = float(hold_base_rate_steps)
 
     def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        arg1 = tf.math.rsqrt(step)
-        arg2 = step * (self.warmup_steps ** -1.5)
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+        step = tf.cast(step, dtype=tf.float32)
+        if self.total_steps < self.warmup_steps_arg:
+            raise ValueError('total_steps must be larger or equal to warmup_steps_arg.')
+
+        learning_rate = 0.5 * self.learning_rate_base * (1 + tf.cos(
+            np.pi * (step - self.warmup_steps_arg - self.hold_base_rate_steps) / 
+            (self.total_steps - self.warmup_steps_arg - self.hold_base_rate_steps)))
+        
+        if self.hold_base_rate_steps > 0:
+            learning_rate = tf.where(step > self.warmup_steps_arg + self.hold_base_rate_steps,
+                                     learning_rate, self.learning_rate_base)
+        
+        if self.warmup_steps_arg > 0:
+            if self.learning_rate_base < self.warmup_learning_rate:
+                raise ValueError(
+                    'learning_rate_base must be larger or equal to warmup_learning_rate.'
+                )
+            slope = (self.learning_rate_base - self.warmup_learning_rate) / self.warmup_steps_arg
+            warmup_rate = slope * step + self.warmup_learning_rate
+            learning_rate = tf.where(step < self.warmup_steps_arg, warmup_rate,
+                                     learning_rate)
+        
+        final_lr = tf.maximum(learning_rate, self.min_learning_rate)
+        return final_lr
 
     def get_config(self):
-        # Ensure attributes are JSON serializable (e.g. convert Tensors to numpy/python types)
-        return {"d_model": float(self.d_model.numpy()) if hasattr(self.d_model, 'numpy') else float(self.d_model),
-                "warmup_steps": self.warmup_steps}
+        return {
+            "learning_rate_base": self.learning_rate_base,
+            "total_steps": self.total_steps,
+            "warmup_steps_arg": self.warmup_steps_arg,
+            "min_learning_rate": self.min_learning_rate,
+            "warmup_learning_rate": self.warmup_learning_rate,
+            "hold_base_rate_steps": self.hold_base_rate_steps
+        }
 
+# Define TRANSFORMER_EPOCHS here, so it's clear for schedule creation
+TRANSFORMER_EPOCHS = 100 # This should be the actual number of epochs for training
 
-learning_rate_schedule = CustomLearningRateSchedule(TRANSFORMER_EMBED_DIM, warmup_steps=WARMUP_STEPS)
+# Recalculate total_training_steps with the final TRANSFORMER_EPOCHS
+total_training_steps_for_schedule = TRANSFORMER_EPOCHS * steps_per_epoch
 
-optimizer = tf.keras.optimizers.Adam(
-    learning_rate_schedule, 
-    beta_1=0.9, 
-    beta_2=0.98, 
-    epsilon=1e-9
+# Instantiate the custom learning rate schedule class
+lr_schedule_fn = CustomLearningRateSchedule(
+    learning_rate_base=LEARNING_RATE,
+    total_steps=total_training_steps_for_schedule,
+    warmup_steps_arg=warmup_steps_calculated,
+    min_learning_rate=MIN_LEARNING_RATE
+)
+
+optimizer = tf.keras.optimizers.AdamW(
+    learning_rate=lr_schedule_fn, # Use the schedule
+    weight_decay=WEIGHT_DECAY,
+    beta_1=0.9, # Common Adam betas
+    beta_2=0.95, # nanoGPT often uses 0.95 for beta2
+    epsilon=1e-8,
+    clipnorm=1.0 # Keep gradient clipping
 )
 
 transformer_model = TransformerModel(
@@ -531,7 +576,7 @@ for input_example_batch, target_example_batch in train_dataset.take(1):
 transformer_model.summary()
 
 print("\nTraining Transformer model...")
-TRANSFORMER_EPOCHS = 20 # Same as original SimpleRNN
+# TRANSFORMER_EPOCHS = 50 # This is now defined above for the LR schedule
 # To match the history object structure for later plotting if needed
 history_transformer = transformer_model.fit(
     train_dataset,
@@ -539,6 +584,7 @@ history_transformer = transformer_model.fit(
     epochs=TRANSFORMER_EPOCHS
 )
 
+# Reinserting the sample_transformer function definition
 def sample_transformer(model, start_string, generation_length=500, temperature=1.0):
     input_eval = [char_to_index[s] for s in start_string]
     input_eval = tf.expand_dims(input_eval, 0) # (1, num_chars_in_start_string)
@@ -567,15 +613,23 @@ def sample_transformer(model, start_string, generation_length=500, temperature=1
 
     return start_string + ''.join(generated_chars)
 
-print('Generated text from Transformer (pre-training, if epochs=0):')
-# This will use randomly initialized weights if EPOCHS was 0 or training hasn't occurred.
-# If trained, it uses trained weights.
-print(sample_transformer(transformer_model, start_string=data[:6], generation_length=300, temperature=0.8))
+# Moved sampling block to after training
+print("\nGenerated text from Transformer *after training*:")
+print(sample_transformer(
+        transformer_model,
+        start_string="ROMEO:", # Changed start string
+        generation_length=300,
+        temperature=0.8)
+)
+
+# Added final loss printing
+print(f"Final training loss:     {history_transformer.history['loss'][-1]:.3f}")
+print(f"Final validation  loss:  {history_transformer.history['val_loss'][-1]:.3f}")
 
 # Save the Transformer model weights
 output_dir = BASE_DIR / "Project_RNN"
 output_dir.mkdir(parents=True, exist_ok=True) # Ensure the directory exists
-transformer_model.save_weights(str(output_dir / "transformer_char_model.weights.h5"))
+transformer_model.save_weights(str(output_dir / f"transformer_char_model_L{transformer_model.num_layers}_E{TRANSFORMER_EPOCHS}.weights.h5"))
 print("\nTransformer model weights saved.")
 
 # Optional: Plot Transformer training history (similar to other models)
