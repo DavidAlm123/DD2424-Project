@@ -186,7 +186,7 @@ class CustomLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSched
         }
 
 # HYPERPARAMETERS
-TRANSFORMER_NUM_LAYERS = 2
+TRANSFORMER_NUM_LAYERS = 8
 TRANSFORMER_EMBED_DIM = 256
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_FF_DIM = 4 * TRANSFORMER_EMBED_DIM
@@ -197,7 +197,7 @@ LEARNING_RATE = 6e-4
 WARMUP_EPOCHS = 1
 MIN_LEARNING_RATE = 6e-5
 TRANSFORMER_EPOCHS = 50 
-EPOCHS_FOR_LOADING = 100
+EPOCHS_FOR_LOADING = 1000
 
 warmup_steps_calculated = WARMUP_EPOCHS * steps_per_epoch
 total_training_steps_for_schedule = TRANSFORMER_EPOCHS * steps_per_epoch
