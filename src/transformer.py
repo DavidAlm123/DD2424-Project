@@ -5,9 +5,10 @@ import re
 import tensorflow as tf
 from keras import layers
 
-train = True  # Set to False to load a pre-trained model instead of training
+train = False  # Set to False to load a pre-trained model instead of training
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
+print(BASE_DIR)
 DATASET_DIR = BASE_DIR / "data" / "shaketext.txt"
 fname = DATASET_DIR
 
@@ -185,7 +186,7 @@ class CustomLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSched
         }
 
 # HYPERPARAMETERS
-TRANSFORMER_NUM_LAYERS = 8
+TRANSFORMER_NUM_LAYERS = 2
 TRANSFORMER_EMBED_DIM = 256
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_FF_DIM = 4 * TRANSFORMER_EMBED_DIM
@@ -196,7 +197,7 @@ LEARNING_RATE = 6e-4
 WARMUP_EPOCHS = 1
 MIN_LEARNING_RATE = 6e-5
 TRANSFORMER_EPOCHS = 50 
-EPOCHS_FOR_LOADING = 1000
+EPOCHS_FOR_LOADING = 100
 
 warmup_steps_calculated = WARMUP_EPOCHS * steps_per_epoch
 total_training_steps_for_schedule = TRANSFORMER_EPOCHS * steps_per_epoch
@@ -335,8 +336,7 @@ for input_example_batch, target_example_batch in train_dataset.take(1):
 transformer_model.summary()
 
 history_transformer = None
-output_dir = DATASET_DIR
-output_dir.mkdir(parents=True, exist_ok=True)
+WEIGHTS_DIR = BASE_DIR / "data"  # Directory for saving/loading model weights
 
 if train:
     print("\nTraining Transformer model...")
@@ -346,7 +346,8 @@ if train:
         epochs=TRANSFORMER_EPOCHS
     )
     
-    transformer_model.save_weights(str(output_dir / f"transformer_char_model_L{transformer_model.num_layers}_E{TRANSFORMER_EPOCHS}.weights.h5"))
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    transformer_model.save_weights(str(WEIGHTS_DIR / f"transformer_char_model_L{transformer_model.num_layers}_E{TRANSFORMER_EPOCHS}.weights.h5"))
     print("\nTransformer model weights saved.")
     
     plt.figure(figsize=(12, 5))
@@ -377,7 +378,7 @@ if train:
     
 else:
     model_weights_filename = f"transformer_char_model_L{TRANSFORMER_NUM_LAYERS}_E{EPOCHS_FOR_LOADING}.weights.h5"
-    model_weights_path = output_dir / model_weights_filename
+    model_weights_path = WEIGHTS_DIR / model_weights_filename
     print(f"Attempting to load model from: {model_weights_path}")
     
     if model_weights_path.exists():
